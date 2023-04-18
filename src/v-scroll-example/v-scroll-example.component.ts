@@ -25,7 +25,7 @@ const PAGE_SIZE = 5;
                 <div *ngIf="ds.loading$ | async" class='example-item loading'>loading...</div>
             </cdk-virtual-scroll-viewport>
         </div>
-        <p>Max number of items per page <b>{{pageSize}}</b></p>
+        <p>Max number of items per page <b>{{pageSize}}</b>, scroll down to load more pages from your API.</p>
     `,
   imports: [CommonModule, ScrollingModule],
   providers: [BackendService],
