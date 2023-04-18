@@ -11,5 +11,19 @@ p {
 }
 
 .example-item {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 1rem;
+  padding: 0 1rem;
   height: 50px;
+}
+
+.example-item + .example-item {
+  border-top: 1px solid darkblue;
+}
+
+.loading {
+  color: darkgray;
 }

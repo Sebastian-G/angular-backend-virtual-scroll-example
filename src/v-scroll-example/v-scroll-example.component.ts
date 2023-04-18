@@ -1,3 +1,4 @@
+import { CollectionViewer, DataSource } from '@angular/cdk/collections';
 import {
   CdkVirtualScrollViewport,
   ScrollDispatcher,
@@ -9,6 +10,7 @@ import {
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
+  inject,
   NgZone,
   OnInit,
   ViewChild,
@@ -16,25 +18,38 @@ import {
 import {
   BehaviorSubject,
   firstValueFrom,
+  Observable,
   of,
+  ReplaySubject,
+  shareReplay,
+  startWith,
+  Subject,
+  Subscription,
   take,
   withLatestFrom,
 } from 'rxjs';
-import { debounceTime, filter, map, tap, throttleTime } from 'rxjs/operators';
+import {
+  debounceTime,
+  filter,
+  map,
+  pairwise,
+  scan,
+  tap,
+  throttleTime,
+} from 'rxjs/operators';
 import { BackendService } from './backend.service';
 
 @Component({
   selector: 'v-scroll-example',
   standalone: true,
   template: `
-  <button (click)="click()">click to fetch initial data</button>
   <div class="container" >
-      <cdk-virtual-scroll-viewport itemSize="4" class='example-viewport'>
-        <ng-container *ngIf="searchResults$ | async as searchResults">
-            <li *cdkVirtualFor="let item of searchResults; let i = index; trackBy: trackByIdx" class='example-item'>
-              {{ item | json }}
-            </li>
-        </ng-container>
+      <cdk-virtual-scroll-viewport itemSize="50" class='example-viewport'>
+            <div *cdkVirtualFor="let item of ds" class='example-item'>
+              <div>{{item.page}}</div>
+              <div>{{item.id}}</div>
+            </div>
+            <div *ngIf="ds.loading$ | async" class='example-item loading'>loading...</div>
       </cdk-virtual-scroll-viewport>
       <!-- <pre>{{ searchResults$ | async | json}}</pre> -->
   </div>
@@ -42,106 +57,91 @@ import { BackendService } from './backend.service';
   imports: [CommonModule, ScrollingModule],
   providers: [BackendService],
 })
-export class VScrollExampleComponent<T = any> implements OnInit, AfterViewInit {
+export class VScrollExampleComponent<T extends { id: string } = any>
+  implements AfterViewInit
+{
   @ViewChild(CdkVirtualScrollViewport)
   private virtualScroll: CdkVirtualScrollViewport;
 
-  private searchPageNumber: number;
-  private searchResultSubject = new BehaviorSubject<T[]>([]);
-  readonly searchResults$ = this.searchResultSubject.asObservable();
-  pagesize = 50;
+  readonly pagesize = 5;
+  readonly ds = new PaginatedDataSource<T>(this.pagesize);
 
   constructor(
-    private backendService: BackendService,
-    private cd: ChangeDetectorRef
-  ) {
-    this.searchPageNumber = 0;
-  }
-
-  ngOnInit(): void {
-    this.searchResultSubject
-      .pipe(tap((it) => console.log('searchResults length', it.length)))
-      .subscribe(() => {
-        this.cd.detectChanges();
-      });
-  }
+    private cd: ChangeDetectorRef // private backendService: BackendService
+  ) {}
 
   ngAfterViewInit(): void {
     this.virtualScroll.scrolledIndexChange
       .pipe(
         debounceTime(100),
-        map(() => this.virtualScroll.measureScrollOffset('bottom')),
         // scrolled to bottom
-        filter((bottomOffset) => bottomOffset === 0),
-        // only if not empty source
-        filter(() => !!this.searchResultSubject.getValue()?.length)
+        filter(() => this.virtualScroll.measureScrollOffset('bottom') === 0)
       )
-      .subscribe((bottomOffset) => {
-        this.searchPageNumber++;
-        this.nextSearchPage(this.searchPageNumber);
-        console.log(
-          'scrolledIndexChange -> bottomOffset:',
-          bottomOffset,
-          this.virtualScroll.getRenderedRange()
-        );
-      });
+      .subscribe(() => this.ds.loadMore());
+  }
+}
 
-    // this.scrollDispatcher
-    //   .scrolled()
-    //   .pipe(
-    //     filter(
-    //       (event) =>
-    //         this.virtualScroll.getRenderedRange().end ===
-    //         this.virtualScroll.getDataLength()
-    //     )
-    //   )
-    //   .subscribe((event) => {
-    //     // console.log(
-    //     //   'new result append; ',
-    //     //   'next render range:',
-    //     //   this.virtualScroll.getRenderedRange()
-    //     // );
-    //     // this.searchPageNumber++;
-    //     // this.nextSearchPage(this.searchPageNumber);
-    //   });
-    //this.scrollDispatcher.register(this.scrollable);
-    //this.scrollDispatcher.scrolled(1000)
-    //    .subscribe((viewport: CdkVirtualScrollViewport) => {
-    //        console.log('scroll triggered', viewport);
-    //    });
+export class PaginatedDataSource<T> extends DataSource<T> {
+  private readonly backendService: BackendService = inject(BackendService);
 
-    // this.virtualScroll.renderedRangeStream.subscribe((range) => {
-    //   console.log('range', range);
-    //   console.log('range2', this.virtualScroll.getRenderedRange());
-    //   if (this.virtualScroll.getRenderedRange().end % 10 === 0) {
-    //     this.nextSearchPage(++this.searchPageNumber);
-    //   }
-    // });
+  private _fetchedPages = new Set<number>();
+  private readonly _dataStream = new BehaviorSubject<T[]>([]);
+
+  private readonly loadingState = new BehaviorSubject<boolean>(false);
+  public readonly loading$ = this.loadingState
+    .asObservable()
+    .pipe(shareReplay());
+
+  constructor(private pageSize = 100) {
+    super();
   }
 
-  nextSearchPage(pageNumber: number): void {
-    this.backendService
-      .fetchApi<T>(pageNumber, this.pagesize)
-      .pipe(
-        tap((it) => console.log('nextpage results', it)),
-        withLatestFrom(this.searchResults$),
-        map(([newPages, oldLoadedPages]: [T[], T[]]) => [
-          ...oldLoadedPages,
-          ...newPages,
-        ])
-      )
-      .subscribe((it) => this.searchResultSubject.next(it));
+  connect(collectionViewer: CollectionViewer): Observable<T[]> {
+    console.log('connect');
+    this.fetchPage(0);
+    return this._dataStream;
   }
 
-  click(): void {
-    this.searchPageNumber = 0;
-    this.backendService
-      .fetchApi(this.searchPageNumber, this.pagesize)
-      .pipe(take(1))
-      .subscribe(this.searchResultSubject);
+  loadMore(): void {
+    const lastFetchedPage: number = [...this._fetchedPages.values()].sort(
+      // required to sort a list of numbers
+      (a, b) => a - b
+    )[this._fetchedPages.size - 1];
+    console.log('loadMore, next page is', lastFetchedPage + 1);
+    this.fetchPage(lastFetchedPage + 1);
   }
 
-  trackByIdx(i: number) {
-    return i;
+  private _getPageForIndex(index: number): number {
+    return Math.floor(index / this.pageSize);
+  }
+
+  disconnect() {
+    this._dataStream.complete();
+    this.loadingState.complete();
+  }
+
+  private fetchPage(page: number) {
+    console.log(
+      'fetch Page',
+      page,
+      '; ',
+      this._fetchedPages.has(page) ? 'is present' : 'will load',
+      '; listing of all fetched pages',
+      [...this._fetchedPages.values()]
+    );
+    if (this._fetchedPages.has(page)) {
+      return;
+    }
+    this.loadingState.next(true);
+    this._fetchedPages.add(page);
+    this.backendService.fetchApi(page, this.pageSize).subscribe({
+      next: (nextPageData) => {
+        this._dataStream.next([
+          ...this._dataStream.getValue(),
+          ...nextPageData,
+        ]);
+      },
+      complete: () => this.loadingState.next(false),
+    });
   }
 }
